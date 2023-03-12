@@ -27,7 +27,7 @@ jobs:
         run: |
           apt update
           apt install -y cmake build-essential lua5.1 pkgconf libjson-c-dev liblua5.1-0-dev python3-venv clang libc++abi-dev libc++-dev
-          apt -t experimental install -y valgrind
+          apt install -y valgrind
           useradd -ms /bin/bash buildbot
 
       - name: Checkout libubox
