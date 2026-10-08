@@ -116,10 +116,30 @@ static int64_t get_timestamp_us(void)
 #endif
 }
 
+/*
+ * kqueue reports read and write readiness as separate events, epoll as one.
+ * Merge them, so that a callback runs once per descriptor and batch.
+ */
+static struct uloop_fd_event *uloop_fd_event_get(struct uloop_fd *u, int *nev)
+{
+	struct uloop_fd_event *cur;
+	int i;
+
+	for (i = 0; i < *nev; i++)
+		if (cur_fds[i].fd == u)
+			return &cur_fds[i];
+
+	cur = &cur_fds[(*nev)++];
+	cur->fd = u;
+	cur->events = 0;
+
+	return cur;
+}
+
 static int uloop_fetch_events(int timeout)
 {
 	struct timespec ts;
-	int nfds, n;
+	int nfds, nev = 0, n;
 
 	if (timeout >= 0) {
 		ts.tv_sec = timeout / 1000;
@@ -128,48 +148,43 @@ static int uloop_fetch_events(int timeout)
 
 	nfds = kevent(poll_fd, NULL, 0, events, ARRAY_SIZE(events), timeout >= 0 ? &ts : NULL);
 	for (n = 0; n < nfds; n++) {
-		if (events[n].filter == EVFILT_TIMER) {
-			struct uloop_interval *tm = events[n].udata;
+		struct kevent *kev = &events[n];
+		struct uloop_fd_event *cur;
+		struct uloop_fd *u;
+
+		if (kev->filter == EVFILT_TIMER) {
+			struct uloop_interval *tm = kev->udata;
 
 			tm->priv.time.fired = get_timestamp_us();
-			tm->expirations += events[n].data;
+			tm->expirations += kev->data;
 			tm->cb(tm);
 
 			continue;
 		}
 
-		struct uloop_fd_event *cur = &cur_fds[n];
-		struct uloop_fd *u = events[n].udata;
-		unsigned int ev = 0;
-
-		cur->fd = u;
-		if (!u)
+		u = kev->udata;
+		if (!u || (kev->filter != EVFILT_READ && kev->filter != EVFILT_WRITE))
 			continue;
 
-		if (events[n].flags & EV_ERROR) {
+		cur = uloop_fd_event_get(u, &nev);
+		cur->events |= kev->filter == EVFILT_READ ? ULOOP_READ : ULOOP_WRITE;
+
+		if (kev->flags & EV_EOF)
+			u->eof = true;
+
+		if (kev->flags & EV_ERROR) {
 			u->error = true;
 			if (!(u->flags & ULOOP_ERROR_CB))
 				uloop_fd_delete(u);
 		}
 
-		if(events[n].filter == EVFILT_READ)
-			ev |= ULOOP_READ;
-		else if (events[n].filter == EVFILT_WRITE)
-			ev |= ULOOP_WRITE;
-
-		if (events[n].flags & EV_EOF)
-			u->eof = true;
-		else if (!ev)
-			cur->fd = NULL;
-
-		cur->events = ev;
 		if (u->flags & ULOOP_EDGE_DEFER) {
 			u->flags &= ~ULOOP_EDGE_DEFER;
 			u->flags |= ULOOP_EDGE_TRIGGER;
 			register_kevent(u, u->flags);
 		}
 	}
-	return nfds;
+	return nev;
 }
 
 static int timer_register(struct uloop_interval *tm, unsigned int msecs)
