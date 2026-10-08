@@ -50,23 +50,29 @@ static uint16_t get_flags(unsigned int flags, unsigned int mask)
 
 static struct kevent events[ULOOP_MAX_EVENTS];
 
-static int register_kevent(struct uloop_fd *fd, unsigned int flags)
+static int register_poll(struct uloop_fd *fd, unsigned int flags)
 {
 	struct timespec timeout = { 0, 0 };
-	struct kevent ev[2];
+	unsigned int registered = fd->flags;
+	struct kevent ev[4];
 	int nev = 0;
 	unsigned int changed;
 	uint16_t kflags;
 
-	if (flags & ULOOP_EDGE_DEFER)
-		flags &= ~ULOOP_EDGE_TRIGGER;
+	/* EV_ADD does not change EV_CLEAR on a filter that already exists */
+	if ((flags ^ registered) & ULOOP_EDGE_TRIGGER) {
+		if (registered & ULOOP_READ)
+			EV_SET(&ev[nev++], fd->fd, EVFILT_READ, EV_DELETE, 0, 0, fd);
+		if (registered & ULOOP_WRITE)
+			EV_SET(&ev[nev++], fd->fd, EVFILT_WRITE, EV_DELETE, 0, 0, fd);
+		registered = 0;
+	}
 
-	changed = flags ^ fd->flags;
-	if (changed & ULOOP_EDGE_TRIGGER)
+	changed = flags ^ registered;
+
+	/* epoll re-arms an edge triggered descriptor on every EPOLL_CTL_MOD */
+	if (flags & ULOOP_EDGE_TRIGGER)
 		changed |= flags;
-
-	if (!changed)
-		return 0;
 
 	if (changed & ULOOP_READ) {
 		kflags = get_flags(flags, ULOOP_READ);
@@ -78,20 +84,13 @@ static int register_kevent(struct uloop_fd *fd, unsigned int flags)
 		EV_SET(&ev[nev++], fd->fd, EVFILT_WRITE, kflags, 0, 0, fd);
 	}
 
+	if (!nev)
+		return 0;
+
 	if (kevent(poll_fd, ev, nev, NULL, 0, &timeout) == -1)
 		return -1;
 
 	return 0;
-}
-
-static int register_poll(struct uloop_fd *fd, unsigned int flags)
-{
-	if (flags & ULOOP_EDGE_TRIGGER)
-		flags |= ULOOP_EDGE_DEFER;
-	else
-		flags &= ~ULOOP_EDGE_DEFER;
-
-	return register_kevent(fd, flags);
 }
 
 static int __uloop_fd_delete(struct uloop_fd *fd)
@@ -199,12 +198,6 @@ static int uloop_fetch_events(int timeout)
 			u->error = true;
 			if (!(u->flags & ULOOP_ERROR_CB))
 				uloop_fd_delete(u);
-		}
-
-		if (u->flags & ULOOP_EDGE_DEFER) {
-			u->flags &= ~ULOOP_EDGE_DEFER;
-			u->flags |= ULOOP_EDGE_TRIGGER;
-			register_kevent(u, u->flags);
 		}
 	}
 	return nev;
