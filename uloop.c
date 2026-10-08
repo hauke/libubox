@@ -34,6 +34,7 @@
 
 #ifdef USE_KQUEUE
 #include <sys/event.h>
+#include <sys/stat.h>
 #endif
 #ifdef USE_EPOLL
 #include <sys/epoll.h>

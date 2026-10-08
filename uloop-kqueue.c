@@ -116,6 +116,29 @@ static int64_t get_timestamp_us(void)
 #endif
 }
 
+static bool fd_is_socket(int fd)
+{
+	struct stat st;
+
+	return !fstat(fd, &st) && S_ISSOCK(st.st_mode);
+}
+
+static bool kevent_is_error(struct kevent *kev, struct uloop_fd *u)
+{
+	if (kev->flags & EV_ERROR)
+		return true;
+
+	if (!(kev->flags & EV_EOF))
+		return false;
+
+	/*
+	 * fflags holds a pending socket error. EOF on a descriptor other than a
+	 * socket is a hangup, which epoll reports as EPOLLHUP. EOF on a socket
+	 * alone only means that the peer stopped sending (EPOLLRDHUP).
+	 */
+	return kev->fflags || !fd_is_socket(u->fd);
+}
+
 /*
  * kqueue reports read and write readiness as separate events, epoll as one.
  * Merge them, so that a callback runs once per descriptor and batch.
@@ -172,7 +195,7 @@ static int uloop_fetch_events(int timeout)
 		if (kev->flags & EV_EOF)
 			u->eof = true;
 
-		if (kev->flags & EV_ERROR) {
+		if (kevent_is_error(kev, u)) {
 			u->error = true;
 			if (!(u->flags & ULOOP_ERROR_CB))
 				uloop_fd_delete(u);
