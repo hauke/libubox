@@ -115,11 +115,17 @@ static int64_t get_timestamp_us(void)
 #endif
 }
 
-static bool fd_is_socket(int fd)
+static bool fd_hangup(int fd)
 {
+	struct sockaddr_storage ss;
+	socklen_t len = sizeof(ss);
 	struct stat st;
 
-	return !fstat(fd, &st) && S_ISSOCK(st.st_mode);
+	if (fstat(fd, &st) || !S_ISSOCK(st.st_mode))
+		return true;
+
+	/* fails once both directions of the connection are shut down */
+	return getpeername(fd, (struct sockaddr *)&ss, &len) != 0;
 }
 
 static bool kevent_is_error(struct kevent *kev, struct uloop_fd *u)
@@ -131,11 +137,11 @@ static bool kevent_is_error(struct kevent *kev, struct uloop_fd *u)
 		return false;
 
 	/*
-	 * fflags holds a pending socket error. EOF on a descriptor other than a
-	 * socket is a hangup, which epoll reports as EPOLLHUP. EOF on a socket
-	 * alone only means that the peer stopped sending (EPOLLRDHUP).
+	 * fflags holds a pending socket error. Otherwise, EOF is a hangup
+	 * (EPOLLHUP) unless only the peer of a socket stopped sending
+	 * (EPOLLRDHUP).
 	 */
-	return kev->fflags || !fd_is_socket(u->fd);
+	return kev->fflags || fd_hangup(u->fd);
 }
 
 /*
