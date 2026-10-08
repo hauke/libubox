@@ -164,8 +164,40 @@ static struct uloop_fd_event *uloop_fd_event_get(struct uloop_fd *u, int *nev)
 	return cur;
 }
 
+struct uloop_timer_batch {
+	struct uloop_timer_batch *next;
+	struct uloop_interval *tm[ULOOP_MAX_EVENTS];
+	int64_t expirations[ULOOP_MAX_EVENTS];
+	int n;
+};
+
+/* batches whose callbacks run, innermost first; a callback may nest uloop_run() */
+static struct uloop_timer_batch *timer_batches;
+
+static void uloop_timer_batch_run(struct uloop_timer_batch *batch)
+{
+	struct uloop_interval *tm;
+	int i;
+
+	batch->next = timer_batches;
+	timer_batches = batch;
+
+	for (i = 0; i < batch->n; i++) {
+		tm = batch->tm[i];
+		if (!tm)
+			continue;
+
+		tm->priv.time.fired = get_timestamp_us();
+		tm->expirations += batch->expirations[i];
+		tm->cb(tm);
+	}
+
+	timer_batches = batch->next;
+}
+
 static int uloop_fetch_events(int timeout)
 {
+	struct uloop_timer_batch batch = {};
 	struct timespec ts;
 	int nfds, nev = 0, n;
 
@@ -181,12 +213,8 @@ static int uloop_fetch_events(int timeout)
 		struct uloop_fd *u;
 
 		if (kev->filter == EVFILT_TIMER) {
-			struct uloop_interval *tm = kev->udata;
-
-			tm->priv.time.fired = get_timestamp_us();
-			tm->expirations += kev->data;
-			tm->cb(tm);
-
+			batch.tm[batch.n] = kev->udata;
+			batch.expirations[batch.n++] = kev->data;
 			continue;
 		}
 
@@ -206,7 +234,16 @@ static int uloop_fetch_events(int timeout)
 				uloop_fd_delete(u);
 		}
 	}
-	return nev;
+
+	/*
+	 * Publish the descriptor events before the interval callbacks run, so
+	 * that uloop_fd_delete() from a callback drops the pending event. A
+	 * nested uloop_run() may consume some of them, so return what is left.
+	 */
+	cur_nfds = nev;
+	uloop_timer_batch_run(&batch);
+
+	return cur_nfds;
 }
 
 static int timer_register(struct uloop_interval *tm, unsigned int msecs)
@@ -224,7 +261,14 @@ static int timer_register(struct uloop_interval *tm, unsigned int msecs)
 
 static int timer_remove(struct uloop_interval *tm)
 {
+	struct uloop_timer_batch *batch;
 	struct kevent ev;
+	int i;
+
+	for (batch = timer_batches; batch; batch = batch->next)
+		for (i = 0; i < batch->n; i++)
+			if (batch->tm[i] == tm)
+				batch->tm[i] = NULL;
 
 	EV_SET(&ev, (uintptr_t)tm, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
 
